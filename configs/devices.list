@@ -1,0 +1,24 @@
+# =====================================================================
+#  机型清单 —— 编译时在 Actions 的 device 一栏填“代号”这一列
+#
+#  格式：代号|平台|子平台|机型名|最大固件
+#  以后想加别的机型：照着加一行即可（去 firmware-selector.openwrt.org
+#  搜型号，页面上 Profile 那行就是代号）；也可以让我一次生成全量清单
+#  （OpenWrt 24.10 里 MT7620/MT7621/MT7628 共 511 个机型）。
+#
+#  注：以前还有个 variant（full/lite）选项，但工作流里从来没实现 lite 分支，
+#      填了也不会变小，已经在 v4.15 从 workflow 里删掉，别再多填这一栏。
+#      闪存装不下时：要么换机型，要么手工把 configs/ac2100.seed 里的大插件注释掉。
+# =====================================================================
+
+# 红米 AC2100（主力机，128MB NAND，全套 UA3F 随便装）
+xiaomi_redmi-router-ac2100|ramips|mt7621|红米AC2100|117.5MB
+
+# 瑞斯康达 / 中兴 MSG1500 X.00（128MB NAND + 256MB 内存，全套随便装）
+raisecom_msg1500-x-00|ramips|mt7621|瑞斯康达 MSG1500 (X.00)|126.2MB
+
+# 小米路由器3G v2（GSWIFI 代号 mi3gv2；16MB 闪存，先试 full，不行换 lite）
+xiaomi_mi-router-3g-v2|ramips|mt7621|小米3G v2|14.5MB
+
+# 优酷X2（GSWIFI 代号 ykx2；16MB 闪存，硬件待确认，先试 full 不行换 lite）
+youku_x2|ramips|mt7620|优酷X2|15.7MB
