@@ -1,0 +1,286 @@
+name: 编译红米AC2100固件
+
+# ---------------------------------------------------------------------
+# 用法：
+#   1) 把本仓库推到 GitHub（公开仓库免费无限时长，私有仓库每月 2000 分钟）
+#   2) 进入仓库页面 -> Actions -> 左边选“编译红米AC2100固件” -> Run workflow
+#   3) 等 60~120 分钟，构建完成后在该次运行的 Artifacts 里下载固件
+# 也可以直接改本文件或 configs/、device-files/ 下的内容再 push，自动触发编译
+# ---------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: "OpenWrt 源码版本标签"
+        required: false
+        default: "v24.10.8"
+      profile:
+        description: "编译哪个版本：campus=校园网防检测版(推荐) / full=全能版"
+        required: false
+        default: "campus"
+      device:
+        description: "机型代号（默认红米AC2100；其它型号见 configs/devices.list 第 1 列）"
+        required: false
+        default: "xiaomi_redmi-router-ac2100"
+      rootpw:
+        description: "root 初始登录密码"
+        required: false
+        default: "root"
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/**"
+      - "configs/**"
+      - "device-files/**"
+
+jobs:
+  build:
+    name: 编译固件
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 2. 释放磁盘空间
+        run: |
+          sudo swapoff -a || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: 3. 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync unzip zlib1g-dev file wget subversion
+
+      - name: 4. 克隆 OpenWrt 源码
+        env:
+          OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'v24.10.8' }}
+        run: |
+          git clone --depth=1 --branch "$OPENWRT_REF" https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          echo "源码版本：$(git log -1 --format='%h %ad %s' --date=short)"
+
+      - name: 5. 添加第三方插件源
+        env:
+          PROFILE: ${{ github.event.inputs.profile || 'campus' }}
+        run: |
+          cd openwrt
+          # Argon 主题（支持 24.10，带暗色 + 自己的设置页）：两个版本都带上
+          # 注意：不要用 Design 主题（luci-theme-design），那是 LEDE 时代的老式 Lua 主题，
+          # 在 24.10 上会导致后台报错（header.htm 里 __entries 为 nil）。
+          # 全能版才需要那个大插件源；校园网版只用官方源 + 固件里已内置的 UA2F，编译更稳
+          if [ "$PROFILE" = "full" ]; then
+            if ! grep -q "kenzok8/small-package" feeds.conf.default; then
+              echo "src-git small https://github.com/kenzok8/small-package.git;main" >> feeds.conf.default
+            fi
+          fi
+          cat feeds.conf.default
+
+      - name: 6. 更新并安装全部软件源
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 7a. 生成 root 密码哈希（编译时算好，首次开机写进系统）
+        env:
+          ROOT_PW: ${{ github.event.inputs.rootpw || 'root' }}
+        run: |
+          cat > /tmp/mkhash.py <<'PY'
+          import crypt, sys
+          pw = sys.argv[1]
+          try:
+              salt = crypt.mksalt(crypt.METHOD_MD5)
+          except Exception:
+              salt = "$1$openwrt1"
+          sys.stdout.write(crypt.crypt(pw, salt) or "")
+          PY
+          HASH="$(python3 /tmp/mkhash.py "$ROOT_PW" 2>/dev/null || true)"
+          if [ -z "$HASH" ]; then
+            HASH="$(openssl passwd -1 -salt openwrt1 "$ROOT_PW" 2>/dev/null || true)"
+          fi
+          if [ -z "$HASH" ]; then
+            echo "!! 无法生成密码哈希，请检查 runner 的 python3/openssl"; exit 1
+          fi
+          # 自检：算出来的哈希必须能反验证通过，否则直接失败，避免刷完没密码
+          python3 - "$HASH" "$ROOT_PW" <<'PY'
+          import crypt, sys
+          h, pw = sys.argv[1], sys.argv[2]
+          ok = bool(h) and crypt.crypt(pw, h) == h
+          print("密码哈希自检：", "通过" if ok else "失败")
+          sys.exit(0 if ok else 1)
+          PY
+          mkdir -p openwrt/files/etc
+          printf '%s' "$HASH" > openwrt/files/etc/rootpw.hash
+          echo "已生成 root 密码哈希（密码本身不写进固件，只写哈希）"
+
+      - name: 7. 注入自定义文件（首次开机设置、无线、UA3F、校园网登录）
+        run: |
+          mkdir -p openwrt/files
+          cp -a device-files/. openwrt/files/
+          # 兜底：仓库里可能还留着历史推送的「UA 防检测中心」(uadetect) 文件
+          # （GitHub 网页上传只会覆盖、不会删旧文件，留着会和 UA3F 页面抢菜单）
+          # 注意：UA3F 本体这次是要进固件的，下面这些路径**不要**再删。
+          rm -rf openwrt/files/usr/sbin/ua-detect-ctl \
+                 openwrt/files/usr/libexec/uadetect-web \
+                 openwrt/files/etc/init.d/uadetect \
+                 openwrt/files/etc/config/uadetect \
+                 openwrt/files/usr/lib/lua/luci/controller/uadetect.lua \
+                 openwrt/files/usr/lib/lua/luci/view/uadetect \
+                 openwrt/files/usr/share/luci/menu.d/luci-app-uadetect.json \
+                 openwrt/files/usr/share/rpcd/acl.d/luci-app-uadetect.json \
+                 openwrt/files/www/luci-static/resources/view/uadetect.js
+          # 兜底 2：仓库里可能还留着已下线的「网络波动监测」和过时资料。
+          # 这些本地早就删了，但 GitHub 网页上传只覆盖不删除，不清理会跟着进固件。
+          rm -rf openwrt/files/etc/init.d/netmon-sampler \
+                 openwrt/files/usr/libexec/netmon-sample \
+                 openwrt/files/usr/share/luci/menu.d/luci-app-netmon.json \
+                 openwrt/files/www/cgi-bin/netmon \
+                 openwrt/files/www/luci-static/resources/view/netmon.js \
+                 openwrt/files/www/cgi-bin/ua2f \
+                 openwrt/files/root/ua-docs \
+                 openwrt/files/root/firewall-antidetect.sh \
+                 openwrt/files/etc/uci-defaults/98-drcomauth-enable
+          # 防检测引擎：UA3F 3.7.0（主，TPROXY:1080）+ UA2F 4.10.2（备，默认关闭）
+          # 判断镜像里到底进了哪个，见第 10 步的自检
+          # 恢复可执行权限（二进制和脚本必须能执行）
+          find openwrt/files -type d -exec chmod 0755 {} +
+          find openwrt/files -type f -exec chmod 0644 {} +
+          chmod 0755 openwrt/files/etc/init.d/*   2>/dev/null || true
+          chmod 0755 openwrt/files/etc/uci-defaults/* 2>/dev/null || true
+          chmod 0755 openwrt/files/usr/bin/*      2>/dev/null || true
+          chmod 0755 openwrt/files/usr/sbin/*     2>/dev/null || true
+          chmod 0755 openwrt/files/usr/libexec/*  2>/dev/null || true
+          # rpcd 插件在子目录里，必须单独给执行位，否则 Argon 设置页挂在 /usr/libexec/rpcd/ 的脚本跑不起来
+          chmod 0755 openwrt/files/usr/libexec/rpcd/* 2>/dev/null || true
+          # cgi-bin 里的网页脚本必须可执行，否则 uhttpd 会返回 403 Forbidden
+          chmod 0755 openwrt/files/www/cgi-bin/* 2>/dev/null || true
+          chmod 0755 openwrt/files/root/*.sh      2>/dev/null || true
+          find openwrt/files -type f
+
+      - name: 8. 生成 .config
+        env:
+          PROFILE: ${{ github.event.inputs.profile || 'campus' }}
+          DEVICE: ${{ github.event.inputs.device || 'xiaomi_redmi-router-ac2100' }}
+        run: |
+          cd openwrt
+          case "$PROFILE" in
+            full) SEED=../configs/ac2100.seed ;;
+            *)    SEED=../configs/ac2100-campus.seed ;;
+          esac
+          TARGET="$(awk -F'|' -v d="$DEVICE" '$1==d {print $2}' ../configs/devices.list)"
+          SUBTARGET="$(awk -F'|' -v d="$DEVICE" '$1==d {print $3}' ../configs/devices.list)"
+          MODEL="$(awk -F'|' -v d="$DEVICE" '$1==d {print $4}' ../configs/devices.list)"
+          if [ -z "$TARGET" ] || [ -z "$SUBTARGET" ]; then
+            echo "!! 机型代号 '$DEVICE' 不在 configs/devices.list 里，请检查第一列"
+            awk -F'|' '!/^#/ && NF>3 {printf "   %-36s %s\n", $1, $4}' ../configs/devices.list
+            exit 1
+          fi
+          echo "机型：$MODEL ($DEVICE)   平台：$TARGET/$SUBTARGET   版本：$PROFILE"
+          cp "$SEED" .config
+          echo "本次用的 seed：$SEED   md5=$(md5sum "$SEED" | cut -d' ' -f1)"
+          # 用选中的机型替换掉配置文件里的目标设备三行
+          grep -v '^CONFIG_TARGET_' .config > .config.new && mv .config.new .config
+          {
+            echo "CONFIG_TARGET_${TARGET}=y"
+            echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}=y"
+            echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y"
+          } >> .config
+          make defconfig
+          # ---- 关键包自检：缺一个就中止，避免刷完才发现是英文界面、没主题 ----
+          #
+          # 硬性要求（缺了就没法用）：luci / luci-compat / curl
+          # 只提醒不中止（缺了也有兜底）：argon 主题、中文语言包、tcpdump
+          #   —— 因为主题和中文词条现在是直接放在 device-files/ 里进镜像的，
+          #      就算这几个包没被 kconfig 选中，镜像里照样有。
+          MISSING=0
+          for sym in CONFIG_PACKAGE_luci=y CONFIG_PACKAGE_luci-compat=y CONFIG_PACKAGE_curl=y ; do
+            grep -qx "$sym" .config || { echo "!! 没编进去（会导致固件不可用）: $sym"; MISSING=1; }
+          done
+          if [ "$MISSING" != 0 ]; then
+            echo "===== 核心包缺失，本次编译在这里中止 ====="
+            exit 1
+          fi
+          echo "----- 只提醒不中止的包 -----"
+          for sym in CONFIG_PACKAGE_luci-theme-argon=y CONFIG_PACKAGE_luci-app-argon-config=y \
+                     CONFIG_PACKAGE_luci-i18n-base-zh-cn=y CONFIG_PACKAGE_luci-i18n-dashboard-zh-cn=y \
+                     CONFIG_PACKAGE_tcpdump=y ; do
+            grep -qx "$sym" .config && echo "    选中 $sym" || echo "    没选中 $sym（由 device-files 兜底）"
+          done
+          echo "核心包自检通过。"
+          echo "=========== 目标设备 ==========="
+          grep -E "^CONFIG_TARGET_[a-z0-9_]+=" .config || true
+          echo "=========== 关键插件是否选中 ==========="
+          grep -E "^CONFIG_PACKAGE_(luci-app-openclash|luci-app-passwall|luci-app-ssr-plus|luci-app-adguardhome|luci-theme-argon|luci-app-mwan3|dnsmasq-full|luci-compat|ipset|iptables-mod-tproxy|kmod-nft-queue|libnetfilter-queue1|curl|tcpdump)=" .config || true
+
+      - name: 9. 下载源码包
+        run: |
+          cd openwrt
+          make -j"$(nproc)" download
+
+      - name: 10. 编译（失败会自动用单线程重跑一次以显示真正的报错）
+        run: |
+          cd openwrt
+          make -j"$(nproc)" || make -j1 V=s
+          # ---- 镜像自检：主题和中文是不是真的进了要打包的 rootfs ----
+          ROOTDIR="$(ls -d build_dir/target-*/root-* 2>/dev/null | head -n1)"
+          echo "staging 根目录：$ROOTDIR"
+          [ -d "$ROOTDIR/www/luci-static/argon" ] || { echo "!! 镜像里没有 argon 主题目录"; exit 1; }
+          ls "$ROOTDIR"/usr/lib/lua/luci/i18n/*.zh-cn.lmo >/dev/null 2>&1 || {
+            echo "!! 镜像里没有中文语言包(*.zh-cn.lmo)"; exit 1; }
+          [ -f "$ROOTDIR/etc/uci-defaults/99-argon-lang" ] || { echo "!! 镜像里没有 99-argon-lang（主题和语言不会被设置）"; exit 1; }
+          # ---- UA3F 主引擎必须在镜像里（缺了整套防检测就是空的，直接中止）----
+          for f in usr/bin/ua3f etc/init.d/ua3f etc/config/ua3f usr/sbin/ua-engine \
+                   usr/lib/lua/luci/controller/ua3f.lua usr/lib/lua/luci/model/cbi/ua3f.lua \
+                   usr/lib/lua/luci/i18n/ua3f.zh-cn.lmo www/luci-static/resources/ua3f/rule.js \
+                   usr/libexec/ua-engine-web www/luci-static/resources/view/ua-engine.js \
+                   usr/share/luci/menu.d/luci-app-ua-engine.json \
+                   usr/share/rpcd/acl.d/luci-app-ua-engine.json; do
+            [ -f "$ROOTDIR/$f" ] || { echo "!! 镜像里缺 UA3F 组件: $f"; exit 1; }
+          done
+          echo "UA3F 二进制大小：$(du -h "$ROOTDIR/usr/bin/ua3f" | cut -f1)"
+          grep -q "option enabled '1'" "$ROOTDIR/etc/config/ua3f" || {
+            echo "!! UA3F 配置不是默认开启状态"; exit 1; }
+          grep -q "option l3_rewrite_ttl_value '128'" "$ROOTDIR/etc/config/ua3f" || {
+            echo "!! UA3F 的 TTL 不是默认 128（电脑人格）"; exit 1; }
+          grep -qi "Windows NT" "$ROOTDIR/etc/config/ua3f" || {
+            echo "!! UA3F 的默认 UA 不是 Windows（跟 TTL 128 不配套）"; exit 1; }
+          # 只保留速度档：TCPts / IPID / TCPWIN 必须是 0，否则 MIPS32 上会逐包走 NFQUEUE 掉速
+          for k in l3_rewrite_tcpts l3_rewrite_ipid l3_rewrite_tcpwin; do
+            grep -q "option $k '0'" "$ROOTDIR/etc/config/ua3f" || {
+              echo "!! $k 不是 0（速度档要求全关）"; exit 1; }
+          done
+          if [ -f "$ROOTDIR/usr/bin/ua2f" ]; then
+            echo "UA2F 备引擎也在镜像里（默认关闭，用 ua-engine ua2f 切过去）"
+          else
+            echo "提示：镜像里没有 ua2f 二进制"
+          fi
+          [ -f "$ROOTDIR/www/cgi-bin/ua2f" ] || echo "提示：镜像里没有 UA2F 网页"
+          [ -f "$ROOTDIR/usr/libexec/portal-probe" ] || echo "提示：镜像里没有 portal-probe（认证门户探测）"
+          [ -f "$ROOTDIR/etc/uci-defaults/99-personal" ] || echo "提示：99-personal 没进镜像，自定义主机名/无线/后台地址会不生效"
+          [ -f "$ROOTDIR/usr/lib/lua/luci/i18n/base.zh-cn.lmo" ] || { echo "!! 缺 base.zh-cn.lmo，中文界面会退回英文"; exit 1; }
+          echo "镜像自检通过：UA3F 防检测 + Argon 主题 + 中文界面 + 认证门户探测都在镜像里。"
+
+      - name: 11. 整理产物
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets -name '*.bin' -exec cp -v {} out/ \;
+          find openwrt/bin/targets -name 'sha256sums' -exec cp -v {} out/ \;
+          find openwrt/bin/targets -name '*.manifest' -exec cp -v {} out/ \;
+          find openwrt/bin/targets \( -name 'config.buildinfo' -o -name 'feeds.buildinfo' -o -name 'version.buildinfo' -o -name 'profiles.json' \) -exec cp -v {} out/ \;
+          ls -lh out
+
+      - name: 12. 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.event.inputs.device || 'xiaomi_redmi-router-ac2100' }}-${{ github.run_number }}
+          path: out
+          if-no-files-found: error
+          retention-days: 30
